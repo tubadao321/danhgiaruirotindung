@@ -1,8 +1,87 @@
 from datetime import datetime
+import json
 import pandas as pd
 import streamlit as st
+import psycopg
 
 from src.model_service import evaluate_application, model_status
+
+
+def get_database_url():
+    """Read the shared PostgreSQL URL from Streamlit secrets."""
+    try:
+        return st.secrets.get("DATABASE_URL", "")
+    except Exception:
+        return ""
+
+
+def db_connect():
+    url = get_database_url()
+    if not url:
+        return None
+    return psycopg.connect(url, connect_timeout=10, sslmode="require")
+
+
+def init_history_table():
+    """Create the shared history table if it does not exist."""
+    conn = db_connect()
+    if conn is None:
+        return False, "Chưa cấu hình DATABASE_URL trong Streamlit Secrets."
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS credit_risk_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        payload JSONB NOT NULL
+                    )"""
+                )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def save_history_item(item):
+    """Save one prediction to the shared PostgreSQL database."""
+    conn = db_connect()
+    if conn is None:
+        return False, "Chưa cấu hình DATABASE_URL trong Streamlit Secrets."
+    try:
+        payload = json.dumps(item, ensure_ascii=False, default=lambda x: x.item() if hasattr(x, "item") else str(x))
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO credit_risk_history (payload) VALUES (%s::jsonb)",
+                    (payload,),
+                )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def load_history(limit=500):
+    """Return recent shared predictions, newest first."""
+    conn = db_connect()
+    if conn is None:
+        return None, "Chưa cấu hình DATABASE_URL trong Streamlit Secrets."
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM credit_risk_history ORDER BY created_at DESC, id DESC LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [row[0] for row in rows], ""
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        conn.close()
+
 
 st.set_page_config(page_title="CreditRisk AI | Nhóm 14", page_icon="📘", layout="wide", initial_sidebar_state="expanded")
 
@@ -144,6 +223,7 @@ hr { border-color:#e0e9f6;margin:1.2rem 0; }
 if "history" not in st.session_state:
     st.session_state.history = []
 
+db_ok, db_message = init_history_table()
 status = model_status()
 with st.sidebar:
     st.markdown('<span class="brand-mark">✦</span><span class="brand-title">CreditRisk AI</span>', unsafe_allow_html=True)
@@ -202,6 +282,14 @@ if page == "Tổng quan & kiểm tra":
         result["application"] = record
         result["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state.last_result = result
+        if db_ok:
+            saved, save_error = save_history_item(result)
+            if saved:
+                st.success("Đã lưu hồ sơ vào lịch sử dùng chung của nhóm.")
+            else:
+                st.error("Không lưu được hồ sơ vào cơ sở dữ liệu. " + save_error)
+        else:
+            st.warning("Lịch sử chưa được lưu bền vững vì cơ sở dữ liệu chưa sẵn sàng. Hãy cấu hình DATABASE_URL trong Streamlit Secrets.")
         st.session_state.history.insert(0, result)
         st.session_state.history = st.session_state.history[:100]
 
@@ -227,13 +315,20 @@ if page == "Tổng quan & kiểm tra":
         st.caption("Hạng A–D sử dụng các ngưỡng Q1/Q2/Q3 đã lưu trong bundle; không suy ra ngưỡng mới từ từng hồ sơ.")
 
 elif page == "Lịch sử hồ sơ":
-    st.markdown('<div class="hero"><div class="eyebrow">APPLICATION LOG</div><h1>📚 Lịch sử hồ sơ</h1><p>Theo dõi các hồ sơ đã phân tích trong phiên làm việc hiện tại và xuất dữ liệu để phục vụ báo cáo.</p></div>', unsafe_allow_html=True)
-    history = st.session_state.history
+    st.markdown('<div class="hero"><div class="eyebrow">APPLICATION LOG</div><h1>📚 Lịch sử hồ sơ</h1><p>Theo dõi lịch sử phân tích dùng chung của nhóm, được lưu trong cơ sở dữ liệu PostgreSQL.</p></div>', unsafe_allow_html=True)
+    if db_ok:
+        history, history_error = load_history(limit=500)
+        if history is None:
+            history = []
+            st.error("Không đọc được lịch sử từ cơ sở dữ liệu: " + history_error)
+    else:
+        history = []
+        st.warning("Cơ sở dữ liệu chưa kết nối nên không thể hiển thị lịch sử dùng chung. " + db_message)
     k1, k2, k3 = st.columns(3)
-    with k1: st.metric("📂 Tổng hồ sơ trong phiên", len(history))
+    with k1: st.metric("📂 Tổng hồ sơ đã lưu", len(history))
     with k2: st.metric("🤖 Dự báo từ mô hình", sum(1 for x in history if x.get("mode") == "model"))
     with k3: st.metric("🧪 Chế độ minh họa", sum(1 for x in history if x.get("mode") != "model"))
-    st.caption("Lịch sử chỉ lưu trong phiên Streamlit; khi khởi động lại ứng dụng, dữ liệu trong phiên sẽ bị xóa.")
+    st.caption("Lịch sử được chia sẻ giữa những người truy cập ứng dụng và vẫn còn sau khi ứng dụng khởi động lại, miễn là cơ sở dữ liệu bên ngoài còn hoạt động.")
     if not history:
         st.info("Chưa có hồ sơ nào được kiểm tra trong phiên này. Hãy tạo dự báo tại trang Tổng quan & kiểm tra.")
     else:
@@ -263,6 +358,10 @@ elif page == "Thông tin hệ thống":
         {"Thành phần": "Ngưỡng A–D", "Đường dẫn": status["thresholds_path"], "Trạng thái": "Đã tìm thấy bundle" if status["ready"] else "Chưa tìm thấy"},
     ]
     st.dataframe(pd.DataFrame(state_rows), hide_index=True, use_container_width=True)
+    if db_ok:
+        st.success("Cơ sở dữ liệu lịch sử: đã kết nối PostgreSQL.")
+    else:
+        st.warning("Cơ sở dữ liệu lịch sử chưa sẵn sàng: " + db_message)
     st.info("Để tạo/cập nhật artifact theo notebook, đặt `credit_risk_cleaned.csv` ở thư mục gốc rồi chạy `python scripts/train_export.py`.")
     st.warning("Prototype phục vụ học tập. Không nhập dữ liệu định danh hoặc dữ liệu tài chính thật của khách hàng. Chỉ số trong báo cáo không đảm bảo hiệu năng của mọi lần huấn luyện lại.")
 
