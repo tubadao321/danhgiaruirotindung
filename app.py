@@ -136,7 +136,7 @@ def ask_gemini(question, current_result, conversation):
 
     # Try the preferred Flash model first. Only try the next model when the
     # API specifically indicates the requested model is unavailable.
-    models_to_try = ("gemini-2.5-flash", "gemini-2.0-flash")
+    models_to_try = ("gemini-2.5-flash", "gemini-3.8-flash")
     last_error = None
     for model_name in models_to_try:
         try:
