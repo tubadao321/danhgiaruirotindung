@@ -66,19 +66,47 @@ def save_history_item(item):
 
 
 def get_gemini_client():
-    """Create Gemini client from Streamlit Secrets without exposing the API key."""
+    """Create Gemini client from Streamlit secrets or environment variables."""
+    import os
+
     try:
         api_key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
         api_key = ""
-    if not api_key:
+    api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key or not str(api_key).strip():
         return None
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=str(api_key).strip())
+
+
+def _friendly_gemini_error(exc):
+    """Return a useful diagnostic without exposing secrets or raw request details."""
+    message = str(exc).lower()
+    error_type = type(exc).__name__
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    status_text = str(status) if status else ""
+
+    if any(term in message for term in ("api_key_invalid", "invalid api key", "api key not valid", "unauthorized", "unauthenticated")) or status_text in {"401", "UNAUTHENTICATED"}:
+        return "Gemini từ chối API key. Hãy kiểm tra GEMINI_API_KEY trong Streamlit Secrets và tạo key mới nếu cần."
+    if any(term in message for term in ("permission_denied", "permission denied", "forbidden")) or status_text in {"403", "PERMISSION_DENIED"}:
+        return "Gemini API không cấp quyền cho yêu cầu này. Kiểm tra API key, project và quyền Gemini API trong Google AI Studio."
+    if any(term in message for term in ("resource_exhausted", "quota", "rate limit", "too many requests")) or status_text in {"429", "RESOURCE_EXHAUSTED"}:
+        return "Gemini API đã chạm hạn mức hoặc giới hạn tốc độ. Kiểm tra quota/billing trong Google AI Studio rồi thử lại sau."
+    if any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model")) or status_text == "404":
+        return "Model Gemini hiện không khả dụng với API key này. Hãy kiểm tra danh sách model được hỗ trợ hoặc chọn model Flash khả dụng."
+    if any(term in message for term in ("deadline_exceeded", "timed out", "timeout", "connection reset", "temporarily unavailable")):
+        return "Kết nối tới Gemini bị gián đoạn hoặc quá thời gian chờ. Vui lòng thử lại sau."
+    if "billing" in message or "billing_not_enabled" in message:
+        return "Project Gemini chưa bật hoặc chưa đủ điều kiện sử dụng API theo chính sách thanh toán hiện tại. Kiểm tra trạng thái project trong Google AI Studio."
+    return f"Gemini gặp lỗi {error_type}" + (f" (mã {status_text})" if status_text else ".") + ". Kiểm tra cấu hình API và thử lại."
 
 
 def ask_gemini(question, current_result, conversation):
-    """Answer using only the current prediction context and recent chat turns."""
-    client = get_gemini_client()
+    """Answer using current prediction context; fall back only when a model is unavailable."""
+    try:
+        client = get_gemini_client()
+    except Exception as exc:
+        return None, _friendly_gemini_error(exc)
     if client is None:
         return None, "Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets."
 
@@ -105,20 +133,40 @@ def ask_gemini(question, current_result, conversation):
         + "\n\nCÂU HỎI MỚI CỦA NGƯỜI DÙNG:\n"
         + question
     )
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config={"temperature": 0.3, "max_output_tokens": 900},
-        )
-        answer = getattr(response, "text", None)
-        if not answer:
-            return None, "Gemini chưa trả về nội dung. Vui lòng thử lại."
-        return answer.strip(), ""
-    except Exception as exc:
-        # Keep details in server logs, show a safe message to visitors.
-        print(f"Gemini request failed: {type(exc).__name__}: {exc}")
-        return None, "Không gọi được Gemini lúc này. Hãy kiểm tra API key, hạn mức API hoặc thử lại sau."
+
+    # Try the preferred Flash model first. Only try the next model when the
+    # API specifically indicates the requested model is unavailable.
+    models_to_try = ("gemini-2.5-flash", "gemini-2.0-flash")
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={"temperature": 0.3, "max_output_tokens": 900},
+            )
+            answer = getattr(response, "text", None)
+            if not answer or not answer.strip():
+                return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
+            return answer.strip(), ""
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            model_unavailable = (
+                any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
+                or str(getattr(exc, "code", "")) == "404"
+                or str(getattr(exc, "status_code", "")) == "404"
+            )
+            if model_unavailable:
+                continue
+            # Do not expose exception text: some SDK errors may include request details.
+            print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}")
+            return None, _friendly_gemini_error(exc)
+
+    if last_error is not None:
+        print(f"Gemini request failed: {type(last_error).__name__}; all configured Flash models unavailable")
+        return None, _friendly_gemini_error(last_error)
+    return None, "Chưa tìm được model Gemini khả dụng. Vui lòng kiểm tra cấu hình API."
 
 
 def load_history(limit=500):
