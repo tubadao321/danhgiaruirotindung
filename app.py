@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import time
 import pandas as pd
 import streamlit as st
 import psycopg
@@ -134,34 +135,51 @@ def ask_gemini(question, current_result, conversation):
         + question
     )
 
-    # Try the preferred Flash model first. Only try the next model when the
-    # API specifically indicates the requested model is unavailable.
-    models_to_try = ("gemini-2.5-flash", "gemini-3.8-flash")
+    # Prefer the current stable Flash model. Fall back only if the API says the
+    # requested model does not exist or is unavailable to this project.
+    models_to_try = ("gemini-3.8-flash", "gemini-2.5-flash")
     last_error = None
     for model_name in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config={"temperature": 0.3, "max_output_tokens": 900},
-            )
-            answer = getattr(response, "text", None)
-            if not answer or not answer.strip():
-                return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
-            return answer.strip(), ""
-        except Exception as exc:
-            last_error = exc
-            message = str(exc).lower()
-            model_unavailable = (
-                any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
-                or str(getattr(exc, "code", "")) == "404"
-                or str(getattr(exc, "status_code", "")) == "404"
-            )
-            if model_unavailable:
-                continue
-            # Do not expose exception text: some SDK errors may include request details.
-            print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}")
-            return None, _friendly_gemini_error(exc)
+        model_unavailable = False
+        # Retry transient server errors with exponential backoff.
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={"temperature": 0.3, "max_output_tokens": 900},
+                )
+                answer = getattr(response, "text", None)
+                if not answer or not answer.strip():
+                    return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
+                return answer.strip(), ""
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                status = str(getattr(exc, "code", "") or getattr(exc, "status_code", "")).upper()
+                model_unavailable = (
+                    any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
+                    or status in {"404", "NOT_FOUND"}
+                )
+                if model_unavailable:
+                    break
+
+                transient_server_error = (
+                    status in {"500", "502", "503", "504", "INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED"}
+                    or any(term in message for term in ("503", "502", "504", "500", "service unavailable", "server error", "temporarily unavailable", "internal error", "deadline_exceeded"))
+                )
+                if transient_server_error and attempt < 2:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+
+                # Log only safe diagnostic metadata, never the API key or prompt.
+                print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={status or 'unknown'}; attempt={attempt + 1}")
+                if transient_server_error:
+                    return None, "Gemini đang tạm thời quá tải hoặc không khả dụng sau 3 lần thử. Vui lòng đợi 30–60 giây rồi gửi lại câu hỏi."
+                return None, _friendly_gemini_error(exc)
+
+        if not model_unavailable:
+            break
 
     if last_error is not None:
         print(f"Gemini request failed: {type(last_error).__name__}; all configured Flash models unavailable")
