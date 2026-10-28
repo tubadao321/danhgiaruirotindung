@@ -1,9 +1,11 @@
 from datetime import datetime
 import json
+import time
 import pandas as pd
 import streamlit as st
 import psycopg
 from google import genai
+from google.genai import types
 
 from src.model_service import evaluate_application, model_status
 
@@ -65,8 +67,18 @@ def save_history_item(item):
         conn.close()
 
 
+@st.cache_resource(show_spinner=False)
+def _build_gemini_client(api_key: str):
+    """Reuse one configured client per API key; avoid rebuilding it per turn."""
+    http_options = types.HttpOptions(
+        timeout=45_000,
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
+    return genai.Client(api_key=api_key, http_options=http_options)
+
+
 def get_gemini_client():
-    """Create Gemini client from Streamlit secrets or environment variables."""
+    """Read the API key and return a cached Gemini client."""
     import os
 
     try:
@@ -76,100 +88,151 @@ def get_gemini_client():
     api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
     if not api_key or not str(api_key).strip():
         return None
-    return genai.Client(api_key=str(api_key).strip())
+    return _build_gemini_client(str(api_key).strip())
 
 
 def _friendly_gemini_error(exc):
-    """Return a useful diagnostic without exposing secrets or raw request details."""
+    """Translate provider errors into actionable, secret-safe messages."""
     message = str(exc).lower()
     error_type = type(exc).__name__
     status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     status_text = str(status) if status else ""
 
     if any(term in message for term in ("api_key_invalid", "invalid api key", "api key not valid", "unauthorized", "unauthenticated")) or status_text in {"401", "UNAUTHENTICATED"}:
-        return "Gemini từ chối API key. Hãy kiểm tra GEMINI_API_KEY trong Streamlit Secrets và tạo key mới nếu cần."
+        return "Gemini từ chối API key. Hãy kiểm tra GEMINI_API_KEY trong Streamlit Secrets."
     if any(term in message for term in ("permission_denied", "permission denied", "forbidden")) or status_text in {"403", "PERMISSION_DENIED"}:
-        return "Gemini API không cấp quyền cho yêu cầu này. Kiểm tra API key, project và quyền Gemini API trong Google AI Studio."
+        return "Gemini API không cấp quyền cho yêu cầu này. Kiểm tra API key và quyền Gemini API của project."
     if any(term in message for term in ("resource_exhausted", "quota", "rate limit", "too many requests")) or status_text in {"429", "RESOURCE_EXHAUSTED"}:
-        return "Gemini API đã chạm hạn mức hoặc giới hạn tốc độ. Kiểm tra quota/billing trong Google AI Studio rồi thử lại sau."
+        return "Gemini API đang chạm hạn mức hoặc giới hạn tốc độ. Kiểm tra quota/billing trong Google AI Studio."
     if any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model")) or status_text == "404":
-        return "Model Gemini hiện không khả dụng với API key này. Hãy kiểm tra danh sách model được hỗ trợ hoặc chọn model Flash khả dụng."
+        return "Model Gemini không khả dụng với API key/project hiện tại. Kiểm tra model access trong Google AI Studio."
+    if status_text in {"503", "UNAVAILABLE"} or "service unavailable" in message or "overloaded" in message:
+        return "Máy chủ Gemini đang quá tải (503). Đây là lỗi phía dịch vụ; thử lại sau và kiểm tra trạng thái/quota API."
     if any(term in message for term in ("deadline_exceeded", "timed out", "timeout", "connection reset", "temporarily unavailable")):
-        return "Kết nối tới Gemini bị gián đoạn hoặc quá thời gian chờ. Vui lòng thử lại sau."
+        return "Kết nối tới Gemini vượt thời gian chờ. Nếu lặp lại, cần kiểm tra độ trễ API và log triển khai."
     if "billing" in message or "billing_not_enabled" in message:
-        return "Project Gemini chưa bật hoặc chưa đủ điều kiện sử dụng API theo chính sách thanh toán hiện tại. Kiểm tra trạng thái project trong Google AI Studio."
-    return f"Gemini gặp lỗi {error_type}" + (f" (mã {status_text})" if status_text else ".") + ". Kiểm tra cấu hình API và thử lại."
+        return "Project Gemini chưa đáp ứng điều kiện thanh toán/quota hiện tại. Kiểm tra trạng thái project trong Google AI Studio."
+    return f"Gemini gặp lỗi {error_type}" + (f" (mã {status_text})" if status_text else "") + ". Kiểm tra log triển khai để xác định nguyên nhân."
 
 
-def ask_gemini(question, current_result, conversation):
-    """Answer using current prediction context; fall back only when a model is unavailable."""
-    try:
-        client = get_gemini_client()
-    except Exception as exc:
-        return None, _friendly_gemini_error(exc)
-    if client is None:
-        return None, "Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets."
+_GEMINI_SYSTEM_INSTRUCTION = """Bạn là CreditRisk AI Assistant — trợ lý AI chuyên nghiệp, thân thiện và có khả năng đối thoại nhiều lượt cho ứng dụng phân tích rủi ro tín dụng của Nhóm 14.
 
-    # Minimize data sent to the model: only model-relevant application fields/results.
+NHIỆM VỤ
+- Trả lời câu hỏi tự nhiên bằng tiếng Việt, hiểu ngữ cảnh những lượt trước và trả lời đúng trọng tâm.
+- Hỗ trợ cả trò chuyện thông thường lẫn kiến thức về machine learning, tín dụng, PD/xác suất vỡ nợ, hạng A–D, phân khúc K-Means, yếu tố SHAP, giới hạn của Random Forest và cách đọc kết quả đang hiển thị.
+- Khi có kết quả hồ sơ hiện tại, hãy dùng đúng các số liệu được cung cấp để giải thích; liên hệ các yếu tố một cách dễ hiểu. SHAP chỉ mô tả đóng góp vào dự báo, không tự chứng minh quan hệ nhân quả.
+- Nếu người dùng hỏi ngoài dữ liệu hiện có, phân biệt rõ kiến thức chung với điều suy ra từ hồ sơ; không giả vờ đã truy cập dữ liệu, web, hệ thống ngân hàng hoặc hồ sơ chưa được cung cấp.
+- Nếu chưa có hồ sơ nào được phân tích, vẫn trả lời như một trợ lý kiến thức thông thường và nói rõ khi câu hỏi cần kết quả hồ sơ để phân tích cụ thể.
+- Giữ hội thoại tự nhiên; không lặp lại lời chào/mô tả năng lực ở mọi lượt. Câu hỏi đơn giản thì trả lời nhanh và gọn; câu hỏi yêu cầu phân tích thì giải thích có cấu trúc, ví dụ minh họa khi hữu ích. Đừng cố nhét mọi câu trả lời vào cùng một độ dài.
+- Không bịa số liệu hay khẳng định chắc chắn về duyệt vay. Đây là công cụ học tập/tham khảo, không thay thế thẩm định tín dụng chuyên môn. Không khuyến khích khai sai dữ liệu hoặc yêu cầu thông tin định danh nhạy cảm như CCCD, số tài khoản hay mật khẩu.
+"""
+
+
+def _build_chat_contents(question, current_result, conversation):
+    """Send a compact, structured multi-turn conversation instead of one giant prompt."""
+    contents = []
+    recent = conversation[-8:] if conversation else []
+    # A valid chat normally starts with a user message. Drop a leading model turn if history was trimmed oddly.
+    while recent and recent[0].get("role") == "assistant":
+        recent = recent[1:]
+    for item in recent:
+        role = "model" if item.get("role") == "assistant" else "user"
+        text_value = str(item.get("content", ""))[:3500]
+        if text_value.strip():
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text_value)]))
+
     context = {}
     if isinstance(current_result, dict):
-        context = {
-            "application": current_result.get("application", {}),
-            "mode": current_result.get("mode"),
-            "pd_display": current_result.get("pd_display"),
-            "grade": current_result.get("grade"),
-            "cluster": current_result.get("cluster"),
-            "summary": current_result.get("summary"),
-            "factors": current_result.get("factors", []),
+        app = current_result.get("application", {})
+        allowed_application_fields = (
+            "person_age", "person_income", "person_home_ownership", "person_emp_length",
+            "loan_intent", "loan_amnt", "loan_int_rate", "loan_percent_income",
+            "cb_person_default_on_file",
+        )
+        if isinstance(app, dict):
+            context["application"] = {k: app[k] for k in allowed_application_fields if k in app}
+        for key in ("mode", "pd_display", "grade", "cluster", "summary"):
+            if current_result.get(key) is not None:
+                context[key] = str(current_result.get(key))[:1800] if key == "summary" else current_result.get(key)
+        factors = current_result.get("factors", [])
+        if isinstance(factors, list):
+            context["factors"] = factors[:8]
+
+    user_text = str(question).strip()
+    if context:
+        user_text = (
+            "NGỮ CẢNH HỒ SƠ HIỆN TẠI (chỉ dùng nếu liên quan đến câu hỏi):\n"
+            + json.dumps(context, ensure_ascii=False, default=str)
+            + "\n\nCÂU HỎI MỚI CỦA NGƯỜI DÙNG:\n"
+            + user_text
+        )
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+    return contents
+
+
+def stream_gemini_answer(question, current_result, conversation):
+    """Stream real model output so users see the answer as it is generated."""
+    import re
+    started = time.perf_counter()
+    first_token_at = None
+    got_text = False
+    model_name = "gemini-3.8-flash"
+    try:
+        client = get_gemini_client()
+        if client is None:
+            yield "⚠️ Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets."
+            return
+
+        # Fast interactions use low thinking; explicit, multi-step analysis gets medium effort.
+        q = str(question).lower()
+        complex_markers = (
+            "phân tích sâu", "phân tích chi tiết", "đánh giá toàn diện", "so sánh", "tính toán chi tiết",
+            "lập kế hoạch", "nhiều bước", "phân tích định lượng", "giải thích chuyên sâu", "báo cáo chi tiết",
+        )
+        thinking_level = "medium" if len(q) > 450 or any(marker in q for marker in complex_markers) else "low"
+        contents = _build_chat_contents(question, current_result, conversation)
+        config = types.GenerateContentConfig(
+            system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
+            max_output_tokens=1400,
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
+        )
+        response_stream = client.models.generate_content_stream(
+            model=model_name,
+            contents=contents,
+            config=config,
+        )
+        for chunk in response_stream:
+            piece = getattr(chunk, "text", None)
+            if piece:
+                if first_token_at is None:
+                    first_token_at = time.perf_counter() - started
+                got_text = True
+                yield piece
+        if not got_text:
+            yield "Mình chưa nhận được nội dung trả lời từ Gemini. Bạn thử gửi lại câu hỏi nhé."
+    except Exception as exc:
+        print(
+            "[CreditRisk AI] request failed: "
+            f"error={type(exc).__name__}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}; "
+            f"elapsed={time.perf_counter() - started:.2f}s"
+        )
+        error_text = _friendly_gemini_error(exc)
+        if got_text:
+            yield "\n\n⚠️ Kết nối bị gián đoạn trước khi hoàn tất câu trả lời. " + error_text
+        else:
+            yield "⚠️ " + error_text
+    finally:
+        elapsed = time.perf_counter() - started
+        st.session_state.ai_last_metrics = {
+            "model": model_name,
+            "thinking_level": locals().get("thinking_level", "low"),
+            "first_token_seconds": first_token_at,
+            "total_seconds": elapsed,
         }
-    system_instruction = """Bạn là CreditRisk AI Assistant, trợ lý giải thích kết quả mô hình rủi ro tín dụng cho mục đích học tập. Trả lời bằng tiếng Việt, rõ ràng và ngắn gọn (thường 100–180 từ, trừ khi người dùng yêu cầu chi tiết). Ưu tiên trả lời trực tiếp câu hỏi. Dựa trên dữ liệu hồ sơ và kết quả được cung cấp; không tự bịa số liệu, không khẳng định quan hệ nhân quả từ SHAP, không coi dự báo là kết luận chắc chắn. Nếu thiếu dữ liệu, hãy nói rõ. Nêu rằng đây chỉ là công cụ tham khảo, không thay thế thẩm định tín dụng chuyên môn và không đưa ra cam kết được duyệt vay. Đề xuất cải thiện chỉ ở mức thông tin chung, không khuyến khích khai sai dữ liệu. Không yêu cầu người dùng cung cấp thông tin định danh như CCCD, số tài khoản, mật khẩu."""
-    recent = conversation[-4:] if conversation else []
-    prompt = (
-        system_instruction
-        + "\n\nNGỮ CẢNH KẾT QUẢ HỒ SƠ HIỆN TẠI (JSON):\n"
-        + json.dumps(context, ensure_ascii=False, default=str)
-        + "\n\nHỘI THOẠI GẦN ĐÂY (JSON):\n"
-        + json.dumps(recent, ensure_ascii=False, default=str)
-        + "\n\nCÂU HỎI MỚI CỦA NGƯỜI DÙNG:\n"
-        + question
-    )
-
-    # Use a current Flash model with low thinking effort for a user-facing chatbot.
-    # Only fall back when the requested model is unavailable (404/model-not-found).
-    models_to_try = ("gemini-3.8-flash", "gemini-3.6-flash")
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config={
-                    "max_output_tokens": 600,
-                    "thinking_config": {"thinking_level": "low"},
-                },
-            )
-            answer = getattr(response, "text", None)
-            if not answer or not answer.strip():
-                return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
-            return answer.strip(), ""
-        except Exception as exc:
-            last_error = exc
-            message = str(exc).lower()
-            model_unavailable = (
-                any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
-                or str(getattr(exc, "code", "")) == "404"
-                or str(getattr(exc, "status_code", "")) == "404"
-            )
-            if model_unavailable:
-                continue
-            # Do not expose exception text: some SDK errors may include request details.
-            print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}")
-            return None, _friendly_gemini_error(exc)
-
-    if last_error is not None:
-        print(f"Gemini request failed: {type(last_error).__name__}; all configured Flash models unavailable")
-        return None, _friendly_gemini_error(last_error)
-    return None, "Chưa tìm được model Gemini khả dụng. Vui lòng kiểm tra cấu hình API."
+        print(
+            f"[CreditRisk AI] model={model_name}; thinking={locals().get('thinking_level', 'low')}; "
+            f"first_token={first_token_at if first_token_at is not None else 'none'}; total={elapsed:.2f}s"
+        )
 
 
 def load_history(limit=500):
@@ -497,7 +560,7 @@ if st.session_state.ai_chat_open:
         head1, head2 = st.columns([5, 1])
         with head1:
             st.markdown("**✦ CreditRisk AI Assistant**")
-            st.caption("Trợ lý Gemini · Tư vấn theo kết quả hồ sơ hiện tại")
+            st.caption("Gemini 3.8 Flash · Hội thoại nhiều lượt · Phản hồi trực tiếp theo luồng")
         with head2:
             if st.button("—", key="minimize_ai_chat", help="Thu nhỏ"):
                 st.session_state.ai_chat_open = False
@@ -514,14 +577,28 @@ if st.session_state.ai_chat_open:
             send_chat = st.form_submit_button("Gửi câu hỏi", type="primary", use_container_width=True)
         if send_chat and user_question.strip():
             current_result = st.session_state.get("last_result")
-            st.session_state.ai_chat_messages.append({"role": "user", "content": user_question.strip()})
-            with st.spinner("Trợ lý đang phân tích kết quả hồ sơ..."):
-                answer, ai_error = ask_gemini(user_question.strip(), current_result, st.session_state.ai_chat_messages[:-1])
-            if answer:
-                st.session_state.ai_chat_messages.append({"role": "assistant", "content": answer})
-            else:
-                st.session_state.ai_chat_messages.append({"role": "assistant", "content": "⚠️ " + ai_error})
+            clean_question = user_question.strip()
+            previous_conversation = list(st.session_state.ai_chat_messages)
+            st.session_state.ai_chat_messages.append({"role": "user", "content": clean_question})
+            with st.chat_message("user"):
+                st.markdown(clean_question)
+            with st.chat_message("assistant"):
+                answer = st.write_stream(
+                    stream_gemini_answer(clean_question, current_result, previous_conversation)
+                )
+            if not isinstance(answer, str):
+                answer = str(answer or "")
+            st.session_state.ai_chat_messages.append({"role": "assistant", "content": answer})
+            metrics = st.session_state.get("ai_last_metrics", {})
+            if metrics:
+                first_token = metrics.get("first_token_seconds")
+                first_label = f"{first_token:.1f}s" if isinstance(first_token, (int, float)) else "chưa nhận được"
+                st.caption(
+                    f"{metrics.get('model', 'Gemini')} · token đầu tiên: {first_label} · "
+                    f"hoàn tất: {metrics.get('total_seconds', 0):.1f}s · "
+                    f"suy luận: {metrics.get('thinking_level', 'low')}"
+                )
             st.rerun()
-        st.caption("Lưu ý: câu trả lời chỉ phục vụ học tập, không phải quyết định tín dụng. Tránh nhập thông tin định danh cá nhân.")
+        st.caption("Trợ lý sử dụng Gemini để trả lời theo hội thoại và kết quả hồ sơ hiện tại. Đây là công cụ học tập, không phải quyết định tín dụng. Tránh nhập thông tin định danh cá nhân.")
 
 st.markdown('<div class="footer-note">CreditRisk AI · Machine Learning Nhóm 14 · Bản demo học tập — không thay thế quy trình thẩm định tín dụng chuyên môn.</div>', unsafe_allow_html=True)
