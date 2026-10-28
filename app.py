@@ -71,7 +71,7 @@ def save_history_item(item):
 def _build_gemini_client(api_key: str):
     """Reuse one configured client per API key; avoid rebuilding it per turn."""
     http_options = types.HttpOptions(
-        timeout=45_000,
+        timeout=20_000,
         retry_options=types.HttpRetryOptions(attempts=1),
     )
     return genai.Client(api_key=api_key, http_options=http_options)
@@ -170,24 +170,60 @@ def _build_chat_contents(question, current_result, conversation):
     return contents
 
 
+def _select_gemini_models(question, current_result):
+    """Route routine turns to a low-latency model and complex analysis to the stronger model."""
+    q = str(question).lower()
+    complex_markers = (
+        "phân tích sâu", "phân tích chi tiết", "đánh giá toàn diện", "so sánh", "tính toán chi tiết",
+        "lập kế hoạch", "nhiều bước", "phân tích định lượng", "giải thích chuyên sâu", "báo cáo chi tiết",
+        "shap", "tại sao", "vì sao", "nguyên nhân", "đánh giá hồ sơ này", "giải thích kết quả",
+        "dự đoán này", "phân tích hồ sơ", "rủi ro cụ thể", "khuyến nghị",
+    )
+    # Use the stronger model for a long or explicitly analytical request; otherwise prioritize latency.
+    if len(q) > 450 or any(marker in q for marker in complex_markers):
+        primary = "gemini-3.8-flash"
+    else:
+        primary = "gemini-3.5-flash-lite"
+    fallback = "gemini-3.5-flash-lite" if primary == "gemini-3.8-flash" else "gemini-3.8-flash"
+    return [primary, fallback]
+
+
+def _is_fallback_worthy(exc):
+    """Use the alternate model only for availability/model-specific failures, not bad credentials."""
+    message = str(exc).lower()
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    status_text = str(status).upper() if status is not None else ""
+    if status_text in {"401", "UNAUTHENTICATED", "403", "PERMISSION_DENIED"}:
+        return False
+    if status_text in {"404", "429", "500", "502", "503", "504", "NOT_FOUND", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED"}:
+        return True
+    return any(term in message for term in (
+        "overloaded", "service unavailable", "temporarily unavailable", "timed out",
+        "deadline exceeded", "connection reset", "model not found", "not_found", "resource_exhausted",
+    ))
+
+
 def stream_gemini_answer(question, current_result, conversation):
-    """Stream real model output so users see the answer as it is generated."""
-    import re
+    """Stream real model output; route by task and fall back once if a model is unavailable."""
     started = time.perf_counter()
     first_token_at = None
     got_text = False
-    model_name = "gemini-3.8-flash"
+    selected_model = "unknown"
+    last_exc = None
+    attempted_models = []
+    thinking_level = "low"
     try:
         client = get_gemini_client()
         if client is None:
             yield "⚠️ Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets."
             return
 
-        # Fast interactions use low thinking; explicit, multi-step analysis gets medium effort.
         q = str(question).lower()
         complex_markers = (
             "phân tích sâu", "phân tích chi tiết", "đánh giá toàn diện", "so sánh", "tính toán chi tiết",
             "lập kế hoạch", "nhiều bước", "phân tích định lượng", "giải thích chuyên sâu", "báo cáo chi tiết",
+            "shap", "tại sao", "vì sao", "nguyên nhân", "đánh giá hồ sơ này", "giải thích kết quả",
+            "dự đoán này", "phân tích hồ sơ", "rủi ro cụ thể", "khuyến nghị",
         )
         thinking_level = "medium" if len(q) > 450 or any(marker in q for marker in complex_markers) else "low"
         contents = _build_chat_contents(question, current_result, conversation)
@@ -196,41 +232,71 @@ def stream_gemini_answer(question, current_result, conversation):
             max_output_tokens=1400,
             thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
         )
-        response_stream = client.models.generate_content_stream(
-            model=model_name,
-            contents=contents,
-            config=config,
-        )
-        for chunk in response_stream:
-            piece = getattr(chunk, "text", None)
-            if piece:
-                if first_token_at is None:
-                    first_token_at = time.perf_counter() - started
-                got_text = True
-                yield piece
+        model_candidates = _select_gemini_models(question, current_result)
+
+        for model_index, candidate in enumerate(model_candidates):
+            selected_model = candidate
+            attempted_models.append(candidate)
+            model_got_text = False
+            try:
+                response_stream = client.models.generate_content_stream(
+                    model=candidate,
+                    contents=contents,
+                    config=config,
+                )
+                for chunk in response_stream:
+                    piece = getattr(chunk, "text", None)
+                    if piece:
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter() - started
+                        got_text = True
+                        model_got_text = True
+                        yield piece
+                if model_got_text:
+                    last_exc = None
+                    break
+                last_exc = RuntimeError(f"Model {candidate} returned no text")
+                if model_index < len(model_candidates) - 1:
+                    print(f"[CreditRisk AI] empty response from {candidate}; trying fallback model")
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                print(
+                    f"[CreditRisk AI] model={candidate} failed; status={status}; "
+                    f"elapsed={time.perf_counter() - started:.2f}s"
+                )
+                # Once any answer text has been shown, never restart with a second model and duplicate it.
+                if got_text:
+                    yield "\n\n⚠️ Kết nối bị gián đoạn giữa câu trả lời. " + _friendly_gemini_error(exc)
+                    return
+                if model_index < len(model_candidates) - 1 and _is_fallback_worthy(exc):
+                    print(f"[CreditRisk AI] falling back from {candidate} to {model_candidates[model_index + 1]}")
+                    continue
+                break
+
         if not got_text:
-            yield "Mình chưa nhận được nội dung trả lời từ Gemini. Bạn thử gửi lại câu hỏi nhé."
-    except Exception as exc:
-        print(
-            "[CreditRisk AI] request failed: "
-            f"error={type(exc).__name__}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}; "
-            f"elapsed={time.perf_counter() - started:.2f}s"
-        )
-        error_text = _friendly_gemini_error(exc)
-        if got_text:
-            yield "\n\n⚠️ Kết nối bị gián đoạn trước khi hoàn tất câu trả lời. " + error_text
-        else:
-            yield "⚠️ " + error_text
+            if last_exc is not None:
+                error_text = _friendly_gemini_error(last_exc)
+                if len(attempted_models) > 1:
+                    yield "⚠️ Cả hai model Gemini đều chưa xử lý được yêu cầu. " + error_text
+                elif isinstance(last_exc, RuntimeError) and "returned no text" in str(last_exc):
+                    yield "⚠️ Gemini chưa trả về nội dung. Bạn thử gửi lại sau ít phút nhé."
+                else:
+                    yield "⚠️ " + error_text
+            else:
+                yield "Mình chưa nhận được nội dung trả lời từ Gemini. Bạn thử gửi lại câu hỏi nhé."
     finally:
         elapsed = time.perf_counter() - started
         st.session_state.ai_last_metrics = {
-            "model": model_name,
-            "thinking_level": locals().get("thinking_level", "low"),
+            "model": selected_model,
+            "models_attempted": attempted_models,
+            "thinking_level": thinking_level,
             "first_token_seconds": first_token_at,
             "total_seconds": elapsed,
         }
         print(
-            f"[CreditRisk AI] model={model_name}; thinking={locals().get('thinking_level', 'low')}; "
+            f"[CreditRisk AI] models={attempted_models}; selected={selected_model}; thinking={thinking_level}; "
             f"first_token={first_token_at if first_token_at is not None else 'none'}; total={elapsed:.2f}s"
         )
 
@@ -560,7 +626,7 @@ if st.session_state.ai_chat_open:
         head1, head2 = st.columns([5, 1])
         with head1:
             st.markdown("**✦ CreditRisk AI Assistant**")
-            st.caption("Gemini 3.8 Flash · Hội thoại nhiều lượt · Phản hồi trực tiếp theo luồng")
+            st.caption("Gemini tự chọn model theo độ khó · Tự chuyển model khi quá tải · Hội thoại nhiều lượt · Streaming")
         with head2:
             if st.button("—", key="minimize_ai_chat", help="Thu nhỏ"):
                 st.session_state.ai_chat_open = False
