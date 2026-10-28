@@ -3,6 +3,7 @@ import json
 import pandas as pd
 import streamlit as st
 import psycopg
+from google import genai
 
 from src.model_service import evaluate_application, model_status
 
@@ -62,6 +63,62 @@ def save_history_item(item):
         return False, str(exc)
     finally:
         conn.close()
+
+
+def get_gemini_client():
+    """Create Gemini client from Streamlit Secrets without exposing the API key."""
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        api_key = ""
+    if not api_key:
+        return None
+    return genai.Client(api_key=api_key)
+
+
+def ask_gemini(question, current_result, conversation):
+    """Answer using only the current prediction context and recent chat turns."""
+    client = get_gemini_client()
+    if client is None:
+        return None, "Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets."
+
+    # Minimize data sent to the model: only model-relevant application fields/results.
+    context = {}
+    if isinstance(current_result, dict):
+        context = {
+            "application": current_result.get("application", {}),
+            "mode": current_result.get("mode"),
+            "pd_display": current_result.get("pd_display"),
+            "grade": current_result.get("grade"),
+            "cluster": current_result.get("cluster"),
+            "summary": current_result.get("summary"),
+            "factors": current_result.get("factors", []),
+        }
+    system_instruction = """Bạn là CreditRisk AI Assistant, trợ lý giải thích kết quả mô hình rủi ro tín dụng cho mục đích học tập. Trả lời bằng tiếng Việt, rõ ràng, dễ hiểu và có cấu trúc. Dựa trên dữ liệu hồ sơ và kết quả được cung cấp; không tự bịa số liệu, không khẳng định quan hệ nhân quả từ SHAP, không coi dự báo là kết luận chắc chắn. Nếu thiếu dữ liệu, hãy nói rõ. Nêu rằng đây chỉ là công cụ tham khảo, không thay thế thẩm định tín dụng chuyên môn và không đưa ra cam kết được duyệt vay. Đề xuất cải thiện chỉ ở mức thông tin chung, không khuyến khích khai sai dữ liệu. Không yêu cầu người dùng cung cấp thông tin định danh như CCCD, số tài khoản, mật khẩu."""
+    recent = conversation[-8:] if conversation else []
+    prompt = (
+        system_instruction
+        + "\n\nNGỮ CẢNH KẾT QUẢ HỒ SƠ HIỆN TẠI (JSON):\n"
+        + json.dumps(context, ensure_ascii=False, default=str)
+        + "\n\nHỘI THOẠI GẦN ĐÂY (JSON):\n"
+        + json.dumps(recent, ensure_ascii=False, default=str)
+        + "\n\nCÂU HỎI MỚI CỦA NGƯỜI DÙNG:\n"
+        + question
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config={"temperature": 0.3, "max_output_tokens": 900},
+        )
+        answer = getattr(response, "text", None)
+        if not answer:
+            return None, "Gemini chưa trả về nội dung. Vui lòng thử lại."
+        return answer.strip(), ""
+    except Exception as exc:
+        # Keep details in server logs, show a safe message to visitors.
+        print(f"Gemini request failed: {type(exc).__name__}: {exc}")
+        return None, "Không gọi được Gemini lúc này. Hãy kiểm tra API key, hạn mức API hoặc thử lại sau."
 
 
 def load_history(limit=500):
@@ -209,6 +266,14 @@ hr { border-color:#e0e9f6;margin:1.2rem 0; }
 [data-testid="stCaptionContainer"] { color:#78879c; }
 .footer-note { color:#718199;font-size:.78rem;border-top:1px solid #dfe8f5;margin-top:2.2rem;padding:1.1rem .15rem 0;line-height:1.7; }
 .footer-note::before { content:"✦";color:#5e70e8;margin-right:.45rem; }
+/* Floating AI assistant launcher and chat panel */
+.st-key-ai_floating_button { position: fixed !important; right: 24px !important; bottom: 22px !important; z-index: 99999 !important; width: 64px !important; }
+.st-key-ai_floating_button button { width: 58px !important; height: 58px !important; border-radius: 50% !important; border: 0 !important; color: white !important; background: linear-gradient(135deg,#3267e9,#7454e8) !important; box-shadow: 0 8px 28px rgba(50,103,233,.38) !important; font-size: 25px !important; }
+.st-key-ai_chat_panel { position: fixed !important; right: 24px !important; bottom: 92px !important; width: min(410px, calc(100vw - 28px)) !important; max-height: min(620px, calc(100vh - 125px)) !important; overflow-y: auto !important; z-index: 99998 !important; background: white !important; border: 1px solid #dce7f5 !important; border-radius: 18px !important; padding: 14px !important; box-shadow: 0 18px 55px rgba(18,45,90,.22) !important; }
+.st-key-ai_chat_panel [data-testid="stVerticalBlock"] { gap: .55rem; }
+.st-key-ai_chat_panel [data-testid="stChatMessage"] { padding: .65rem .75rem; }
+.st-key-ai_chat_panel [data-testid="stForm"] { border: 0; padding: 0; background: transparent; }
+@media (max-width: 700px) { .st-key-ai_floating_button { right: 12px !important; bottom: 12px !important; } .st-key-ai_chat_panel { right: 8px !important; bottom: 78px !important; width: calc(100vw - 16px) !important; max-height: calc(100vh - 95px) !important; } }
 @media (max-width: 700px) {
   .hero { padding:1.15rem 1.2rem;border-radius:16px; }
   .hero h1 { font-size:1.55rem; }
@@ -364,5 +429,48 @@ elif page == "Thông tin hệ thống":
         st.warning("Cơ sở dữ liệu lịch sử chưa sẵn sàng: " + db_message)
     st.info("Để tạo/cập nhật artifact theo notebook, đặt `credit_risk_cleaned.csv` ở thư mục gốc rồi chạy `python scripts/train_export.py`.")
     st.warning("Prototype phục vụ học tập. Không nhập dữ liệu định danh hoặc dữ liệu tài chính thật của khách hàng. Chỉ số trong báo cáo không đảm bảo hiệu năng của mọi lần huấn luyện lại.")
+
+# Floating Gemini assistant: each visitor gets a private chat in their Streamlit session.
+if "ai_chat_open" not in st.session_state:
+    st.session_state.ai_chat_open = False
+if "ai_chat_messages" not in st.session_state:
+    st.session_state.ai_chat_messages = []
+
+with st.container(key="ai_floating_button"):
+    if st.button("✦", key="toggle_ai_chat", help="Mở/thu nhỏ trợ lý AI"):
+        st.session_state.ai_chat_open = not st.session_state.ai_chat_open
+        st.rerun()
+
+if st.session_state.ai_chat_open:
+    with st.container(key="ai_chat_panel", border=True):
+        head1, head2 = st.columns([5, 1])
+        with head1:
+            st.markdown("**✦ CreditRisk AI Assistant**")
+            st.caption("Trợ lý Gemini · Tư vấn theo kết quả hồ sơ hiện tại")
+        with head2:
+            if st.button("—", key="minimize_ai_chat", help="Thu nhỏ"):
+                st.session_state.ai_chat_open = False
+                st.rerun()
+
+        if not st.session_state.ai_chat_messages:
+            st.info("Xin chào! Tôi có thể giải thích PD, hạng tín dụng, phân khúc và các yếu tố SHAP của hồ sơ bạn vừa phân tích.")
+        for message in st.session_state.ai_chat_messages[-12:]:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        with st.form("ai_chat_form", clear_on_submit=True):
+            user_question = st.text_input("Câu hỏi", placeholder="Ví dụ: Vì sao hồ sơ này có PD cao?", label_visibility="collapsed", max_chars=1200)
+            send_chat = st.form_submit_button("Gửi câu hỏi", type="primary", use_container_width=True)
+        if send_chat and user_question.strip():
+            current_result = st.session_state.get("last_result")
+            st.session_state.ai_chat_messages.append({"role": "user", "content": user_question.strip()})
+            with st.spinner("Trợ lý đang phân tích kết quả hồ sơ..."):
+                answer, ai_error = ask_gemini(user_question.strip(), current_result, st.session_state.ai_chat_messages[:-1])
+            if answer:
+                st.session_state.ai_chat_messages.append({"role": "assistant", "content": answer})
+            else:
+                st.session_state.ai_chat_messages.append({"role": "assistant", "content": "⚠️ " + ai_error})
+            st.rerun()
+        st.caption("Lưu ý: câu trả lời chỉ phục vụ học tập, không phải quyết định tín dụng. Tránh nhập thông tin định danh cá nhân.")
 
 st.markdown('<div class="footer-note">CreditRisk AI · Machine Learning Nhóm 14 · Bản demo học tập — không thay thế quy trình thẩm định tín dụng chuyên môn.</div>', unsafe_allow_html=True)
