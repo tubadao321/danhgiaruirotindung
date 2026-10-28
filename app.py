@@ -1,6 +1,5 @@
 from datetime import datetime
 import json
-import time
 import pandas as pd
 import streamlit as st
 import psycopg
@@ -123,8 +122,8 @@ def ask_gemini(question, current_result, conversation):
             "summary": current_result.get("summary"),
             "factors": current_result.get("factors", []),
         }
-    system_instruction = """Bạn là CreditRisk AI Assistant, trợ lý giải thích kết quả mô hình rủi ro tín dụng cho mục đích học tập. Trả lời bằng tiếng Việt, rõ ràng, dễ hiểu và có cấu trúc. Dựa trên dữ liệu hồ sơ và kết quả được cung cấp; không tự bịa số liệu, không khẳng định quan hệ nhân quả từ SHAP, không coi dự báo là kết luận chắc chắn. Nếu thiếu dữ liệu, hãy nói rõ. Nêu rằng đây chỉ là công cụ tham khảo, không thay thế thẩm định tín dụng chuyên môn và không đưa ra cam kết được duyệt vay. Đề xuất cải thiện chỉ ở mức thông tin chung, không khuyến khích khai sai dữ liệu. Không yêu cầu người dùng cung cấp thông tin định danh như CCCD, số tài khoản, mật khẩu."""
-    recent = conversation[-8:] if conversation else []
+    system_instruction = """Bạn là CreditRisk AI Assistant, trợ lý giải thích kết quả mô hình rủi ro tín dụng cho mục đích học tập. Trả lời bằng tiếng Việt, rõ ràng và ngắn gọn (thường 100–180 từ, trừ khi người dùng yêu cầu chi tiết). Ưu tiên trả lời trực tiếp câu hỏi. Dựa trên dữ liệu hồ sơ và kết quả được cung cấp; không tự bịa số liệu, không khẳng định quan hệ nhân quả từ SHAP, không coi dự báo là kết luận chắc chắn. Nếu thiếu dữ liệu, hãy nói rõ. Nêu rằng đây chỉ là công cụ tham khảo, không thay thế thẩm định tín dụng chuyên môn và không đưa ra cam kết được duyệt vay. Đề xuất cải thiện chỉ ở mức thông tin chung, không khuyến khích khai sai dữ liệu. Không yêu cầu người dùng cung cấp thông tin định danh như CCCD, số tài khoản, mật khẩu."""
+    recent = conversation[-4:] if conversation else []
     prompt = (
         system_instruction
         + "\n\nNGỮ CẢNH KẾT QUẢ HỒ SƠ HIỆN TẠI (JSON):\n"
@@ -135,51 +134,37 @@ def ask_gemini(question, current_result, conversation):
         + question
     )
 
-    # Prefer the current stable Flash model. Fall back only if the API says the
-    # requested model does not exist or is unavailable to this project.
-    models_to_try = ("gemini-3.8-flash", "gemini-2.5-flash")
+    # Use a current Flash model with low thinking effort for a user-facing chatbot.
+    # Only fall back when the requested model is unavailable (404/model-not-found).
+    models_to_try = ("gemini-3.8-flash", "gemini-3.6-flash")
     last_error = None
     for model_name in models_to_try:
-        model_unavailable = False
-        # Retry transient server errors with exponential backoff.
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config={"temperature": 0.3, "max_output_tokens": 900},
-                )
-                answer = getattr(response, "text", None)
-                if not answer or not answer.strip():
-                    return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
-                return answer.strip(), ""
-            except Exception as exc:
-                last_error = exc
-                message = str(exc).lower()
-                status = str(getattr(exc, "code", "") or getattr(exc, "status_code", "")).upper()
-                model_unavailable = (
-                    any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
-                    or status in {"404", "NOT_FOUND"}
-                )
-                if model_unavailable:
-                    break
-
-                transient_server_error = (
-                    status in {"500", "502", "503", "504", "INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED"}
-                    or any(term in message for term in ("503", "502", "504", "500", "service unavailable", "server error", "temporarily unavailable", "internal error", "deadline_exceeded"))
-                )
-                if transient_server_error and attempt < 2:
-                    time.sleep(1.5 * (2 ** attempt))
-                    continue
-
-                # Log only safe diagnostic metadata, never the API key or prompt.
-                print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={status or 'unknown'}; attempt={attempt + 1}")
-                if transient_server_error:
-                    return None, "Gemini đang tạm thời quá tải hoặc không khả dụng sau 3 lần thử. Vui lòng đợi 30–60 giây rồi gửi lại câu hỏi."
-                return None, _friendly_gemini_error(exc)
-
-        if not model_unavailable:
-            break
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={
+                    "max_output_tokens": 600,
+                    "thinking_config": {"thinking_level": "low"},
+                },
+            )
+            answer = getattr(response, "text", None)
+            if not answer or not answer.strip():
+                return None, "Gemini đã phản hồi nhưng không có nội dung. Vui lòng thử câu hỏi khác."
+            return answer.strip(), ""
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            model_unavailable = (
+                any(term in message for term in ("not_found", "model not found", "not supported for generatecontent", "unknown model"))
+                or str(getattr(exc, "code", "")) == "404"
+                or str(getattr(exc, "status_code", "")) == "404"
+            )
+            if model_unavailable:
+                continue
+            # Do not expose exception text: some SDK errors may include request details.
+            print(f"Gemini request failed: {type(exc).__name__}; model={model_name}; status={getattr(exc, 'code', '') or getattr(exc, 'status_code', '')}")
+            return None, _friendly_gemini_error(exc)
 
     if last_error is not None:
         print(f"Gemini request failed: {type(last_error).__name__}; all configured Flash models unavailable")
